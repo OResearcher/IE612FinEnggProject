@@ -1,0 +1,11 @@
+Summary Statistics
+=================
+
+Mean Reward: 54.8820
+Std Reward: 18.3382
+Median Reward: 54.0000
+Mean Final Wealth: 23.4169
+Std Final Wealth: 26.5725
+Median Final Wealth: 17.7256
+Mean Goals Taken: 2.9790
+Number of Episodes: 1000.0000
