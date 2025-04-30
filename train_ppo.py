@@ -7,43 +7,39 @@ from stable_baselines3.common.vec_env import SubprocVecEnv, VecMonitor
 from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback
 import time
 import os
+import multiprocessing  # Add this import
 
 # Import the custom environment
 from gbwm_env import GBWMEnv
 
 # --- Configuration ---
 # Environment Parameters
-NUM_GOALS = 4
+NUM_GOALS = 16 
 TIME_HORIZON = 16
 INITIAL_WEALTH_FACTOR = 12.0
 INITIAL_WEALTH_EXPONENT = 0.85
-W_MAX = 1_000_000.0
-MAX_STEPS = TIME_HORIZON + 5  # Safety parameter to prevent infinite running
+MAX_STEPS = TIME_HORIZON + 5
 
-# PPO Hyperparameters (Adjusted for better stability)
+# PPO Hyperparameters from the paper (modified from your current values)
 N_TRAJ = 50_000
-LEARNING_RATE = 0.0003  # Reduced from 0.01 for better stability
-CLIP_RANGE = 0.2  # More standard value
+LEARNING_RATE = 0.01  # Paper uses η = 0.01
+CLIP_RANGE = 0.5     # Paper uses ε = 0.50
 N_NEUR = 64
 
 # SB3 Specific Hyperparameters
 N_ENVS = 8
-N_STEPS = 2048  # Steps per environment per update
-BATCH_SIZE = 256  # Larger mini-batch size
+N_STEPS = 2048
+BATCH_SIZE = 4800    # Paper uses M = 4800
 N_EPOCHS = 10
 GAMMA = 1.0
 GAE_LAMBDA = 0.95
-ENT_COEF = 0.0
-VF_COEF = 0.5
 
 # Calculate total timesteps needed
-TOTAL_TIMESTEPS = N_TRAJ * (TIME_HORIZON + 1)  # 50,000 * 17 = 850,000
+TOTAL_TIMESTEPS = N_TRAJ * TIME_HORIZON  # 50,000 * 16 = 800,000
 
 # --- File Paths ---
 LOG_DIR = "./ppo_gbwm_logs/"
 MODEL_SAVE_PATH = "./ppo_gbwm_model"
-os.makedirs(LOG_DIR, exist_ok=True)
-os.makedirs(f"{LOG_DIR}/checkpoints", exist_ok=True)
 
 # --- Custom Callback for Progress Tracking ---
 class ProgressTrackerCallback(BaseCallback):
@@ -76,35 +72,38 @@ def make_env():
             time_horizon=TIME_HORIZON,
             initial_wealth_factor=INITIAL_WEALTH_FACTOR,
             initial_wealth_exponent=INITIAL_WEALTH_EXPONENT,
-            w_max=W_MAX,
-            max_steps=MAX_STEPS  # Add safety parameter to prevent infinite running
+            max_steps=MAX_STEPS
         )
         return env
     return _init
 
 if __name__ == "__main__":
+    # Add multiprocessing support
+    multiprocessing.set_start_method('spawn')
+    
+    os.makedirs(LOG_DIR, exist_ok=True)
+    os.makedirs(f"{LOG_DIR}/checkpoints", exist_ok=True)
+    
     try:
         print("Setting up vectorized environment...")
-        
         # Create and monitor vectorized environment
         env = SubprocVecEnv([make_env() for _ in range(N_ENVS)])
         env = VecMonitor(env, f"{LOG_DIR}/monitor")
         
         print(f"Using {N_ENVS} parallel environments.")
-
+        
         # Create callbacks for checkpointing and progress tracking
         checkpoint_callback = CheckpointCallback(
-            save_freq=50000,  # Save model every 50k steps
+            save_freq=50000,
             save_path=f"{LOG_DIR}/checkpoints",
             name_prefix="ppo_gbwm_model"
         )
-        
         progress_callback = ProgressTrackerCallback(verbose=1)
         
-        # Define network architecture with tanh activation for stability
+        # Define network architecture with 2 hidden layers of 64 neurons each
         policy_kwargs = dict(
             net_arch=dict(pi=[N_NEUR, N_NEUR], vf=[N_NEUR, N_NEUR]),
-            activation_fn=torch.nn.Tanh
+            activation_fn=torch.nn.ReLU  # Paper doesn't specify, but ReLU is standard
         )
         
         print("Defining PPO model...")
@@ -118,12 +117,9 @@ if __name__ == "__main__":
             gamma=GAMMA,
             gae_lambda=GAE_LAMBDA,
             clip_range=CLIP_RANGE,
-            ent_coef=ENT_COEF,
-            vf_coef=VF_COEF,
             policy_kwargs=policy_kwargs,
             verbose=1,
-            tensorboard_log=LOG_DIR,
-            device="auto"
+            tensorboard_log=LOG_DIR
         )
         
         print("Model defined:")
@@ -132,36 +128,11 @@ if __name__ == "__main__":
         print(f"Starting training for {TOTAL_TIMESTEPS} timesteps...")
         start_time = time.time()
         
-        # Try to run with tensorboard, catch error if not installed
-        try:
-            model.learn(
-                total_timesteps=TOTAL_TIMESTEPS,
-                callback=[checkpoint_callback, progress_callback],
-                log_interval=10,
-                tb_log_name="PPO_GBWM_Run"
-            )
-        except Exception as e:
-            if "tensorboard is not installed" in str(e):
-                print("\nTensorBoard error: Please install tensorboard with 'pip install tensorboard'")
-                print("Continuing training without TensorBoard logging...\n")
-                
-                # Try again without tensorboard
-                model = PPO(
-                    "MlpPolicy", env, learning_rate=LEARNING_RATE, n_steps=N_STEPS,
-                    batch_size=BATCH_SIZE, n_epochs=N_EPOCHS, gamma=GAMMA,
-                    gae_lambda=GAE_LAMBDA, clip_range=CLIP_RANGE,
-                    ent_coef=ENT_COEF, vf_coef=VF_COEF,
-                    policy_kwargs=policy_kwargs, verbose=1, tensorboard_log=None
-                )
-                
-                model.learn(
-                    total_timesteps=TOTAL_TIMESTEPS,
-                    callback=[checkpoint_callback, progress_callback],
-                    log_interval=10
-                )
-            else:
-                raise e
-                
+        model.learn(
+            total_timesteps=TOTAL_TIMESTEPS,
+            callback=[checkpoint_callback, progress_callback]
+        )
+        
         end_time = time.time()
         print(f"Training finished in {end_time - start_time:.2f} seconds.")
         
@@ -171,7 +142,6 @@ if __name__ == "__main__":
         
     except Exception as e:
         print(f"Error during training: {e}")
-    
     finally:
         # Clean up
         try:

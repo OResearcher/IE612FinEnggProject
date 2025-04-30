@@ -5,13 +5,14 @@ from gymnasium import spaces
 class GBWMEnv(gym.Env):
     """
     Custom Environment for Goals-Based Wealth Management (GBWM).
-    Follows the Gymnasium API.
+    Follows the Gymnasium API and implements the environment as described in:
+    'Reinforcement learning for Multiple Goals in Goals-Based Wealth Management'
     """
 
     metadata = {'render_modes': [], 'render_fps': 1}
 
     def __init__(self,
-                 num_goals=4,
+                 num_goals=16,
                  time_horizon=16,
                  initial_wealth_factor=12.0,
                  initial_wealth_exponent=0.85,
@@ -21,8 +22,7 @@ class GBWMEnv(gym.Env):
                  goal_utility_increment=1.0,
                  portfolio_means=None,
                  portfolio_stddevs=None,
-                 w_max=1_000_000.0,
-                 max_steps=None):  # Added max_steps parameter
+                 max_steps=None):  # Removed w_max as we'll calculate it dynamically
         super().__init__()
         
         self.num_goals = num_goals
@@ -33,7 +33,6 @@ class GBWMEnv(gym.Env):
         self.goal_cost_growth = goal_cost_growth
         self.goal_utility_base = goal_utility_base
         self.goal_utility_increment = goal_utility_increment
-        self.w_max = w_max
         
         # Safety parameter to prevent infinite running
         self.max_steps = max_steps if max_steps is not None else time_horizon + 10
@@ -54,14 +53,27 @@ class GBWMEnv(gym.Env):
             self.n_portfolios = 15
             min_mean, max_mean = 0.052632, 0.088636
             min_std, max_std = 0.037351, 0.195437
+            
+            # The paper specifies equally spaced mean returns
             self.portfolio_means = np.linspace(min_mean, max_mean, self.n_portfolios)
-            self.portfolio_stddevs = np.linspace(min_std, max_std, self.n_portfolios)
+            
+            # For stddevs, we use a mapping from the efficient frontier
+            # In reality, these would follow a non-linear relationship
+            # This is an approximation based on the paper's mentioned range
+            self.portfolio_stddevs = np.array([
+                0.037351, 0.045000, 0.055000, 0.065000, 0.075000,
+                0.085000, 0.095000, 0.110000, 0.125000, 0.140000,
+                0.155000, 0.170000, 0.180000, 0.190000, 0.195437
+            ])
         else:
             self.n_portfolios = len(portfolio_means)
             self.portfolio_means = np.array(portfolio_means)
             self.portfolio_stddevs = np.array(portfolio_stddevs)
             assert len(portfolio_means) == len(portfolio_stddevs), "Means and stddevs must have same length"
         
+        # Calculate w_max dynamically using the paper's approach
+        self.w_max = self._compute_w_max()
+            
         # Gymnasium Setup
         self.action_space = spaces.MultiDiscrete([2, self.n_portfolios])
         self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(2,), dtype=np.float32)
@@ -70,6 +82,14 @@ class GBWMEnv(gym.Env):
         self.current_time = 0
         self.current_wealth = self.initial_wealth
         self.total_reward = 0.0
+
+    def _compute_w_max(self):
+        """Compute maximum wealth bound based on GBM dynamics as described in the paper."""
+        μ_max = np.max(self.portfolio_means)
+        σ_max = np.max(self.portfolio_stddevs)
+        return self.initial_wealth * np.exp(
+            (μ_max - 0.5 * σ_max**2) * self.time_horizon + 3 * σ_max * np.sqrt(self.time_horizon)
+        )
 
     def _get_obs(self):
         """Returns the current observation."""
@@ -83,8 +103,29 @@ class GBWMEnv(gym.Env):
             "current_time": self.current_time,
             "current_wealth": self.current_wealth,
             "total_reward": self.total_reward,
-            "step_count": self.step_count
+            "step_count": self.step_count,
+            "w_max": self.w_max,
+            "action_mask": self._get_action_mask()  # Add action masking
         }
+    
+    def _get_action_mask(self):
+        """Generate a mask for valid actions at the current state."""
+        mask = np.ones((2, self.n_portfolios), dtype=np.int8)
+        
+        # Mask portfolio choices at t=T (not needed)
+        if self.current_time == self.time_horizon:
+            mask[1, :] = 0
+        
+        # Mask goal choices in non-goal years
+        if self.current_time not in self.goal_times:
+            mask[0, :] = 0
+            
+        # Mask goal-taking if insufficient wealth
+        if self.current_time in self.goal_times:
+            if self.current_wealth < self.goal_costs[self.current_time]:
+                mask[0, 1] = 0  # Mask the "take goal" action
+            
+        return mask
 
     def reset(self, seed=None, options=None):
         """Resets the environment to the initial state."""
@@ -152,7 +193,7 @@ class GBWMEnv(gym.Env):
         observation = self._get_obs()
         info = self._get_info()
         
-        # Ensure wealth doesn't exceed W_max unreasonably
+        # Ensure wealth doesn't exceed bounds unreasonably
         self.current_wealth = min(self.current_wealth, self.w_max * 1.5)
         
         return observation, step_reward, terminated, truncated, info
@@ -169,6 +210,7 @@ if __name__ == '__main__':
     
     print("Initial Observation:", obs)
     print("Initial Info:", info)
+    print(f"W_max calculated: {info['w_max']:.2f}")
     
     terminated = False
     truncated = False
@@ -176,6 +218,9 @@ if __name__ == '__main__':
     
     # Run until either terminated or truncated
     while not (terminated or truncated):
+        # In PPO implementation, you would use this mask to guide policy
+        action_mask = info["action_mask"]
+        
         action = env.action_space.sample()
         obs, reward, terminated, truncated, info = env.step(action)
         total_reward_run += reward
@@ -194,3 +239,28 @@ if __name__ == '__main__':
     print(f"Total Accumulated Utility: {total_reward_run:.2f}")
     
     env.close()
+
+# For PPO training, use these hyperparameters from the paper:
+"""
+# PPO Training Code (pseudo-code)
+from stable_baselines3 import PPO
+
+# Hyperparameters from the paper
+model = PPO(
+    policy="MlpPolicy",
+    env=env,
+    learning_rate=0.01,           # η = 0.01
+    n_steps=16,                   # Time horizon steps
+    batch_size=4800,              # M = 4800
+    n_epochs=10,                  # Number of epochs per update
+    gamma=0.99,                   # Discount factor
+    clip_range=0.5,               # ε = 0.50
+    policy_kwargs={
+        "net_arch": [dict(pi=[64, 64], vf=[64, 64])]  # N_neur = 64
+    },
+    verbose=1
+)
+
+# Train for N_traj = 50,000 trajectories
+model.learn(total_timesteps=50000 * 16)
+"""
